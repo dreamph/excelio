@@ -27,14 +27,14 @@ High-level features:
       - Pointer types for the above
   - Validation via go-playground/validator
   - Streaming read APIs (low memory):
-      - StreamFile / Stream + WithStreamRead handler
+      - StreamFile / Stream + OnStreamRow handler
   - Error tracking:
       - RowError provides row/column/field/value/error details
       - WriteErrors: write error messages back into an existing Excel file (by path)
       - WriteErrorsTo: write a new Excel file with error messages to an io.Writer
 
 For lowest memory usage:
-  - Prefer StreamFile / Stream with WithStreamRead(...)
+  - Prefer StreamFile / Stream with OnStreamRow(...)
 For simplicity:
   - Use ReadFile / Read to get a []T and a []RowError.
 */
@@ -63,7 +63,7 @@ type RowHandler[T any] func(rowIdx, logicalIdx int, obj *T, rowErrs []RowError) 
 // GenericRowHandler is an internal, type-erased handler stored in Options.
 type GenericRowHandler func(rowIdx, logicalIdx int, obj any, rowErrs []RowError) error
 
-// Option is the configuration option type for Read/Stream APIs.
+// Option is the configuration option type for Read/Stream/Write APIs.
 type Option func(*Options)
 
 /* =========================================================
@@ -823,7 +823,7 @@ func readFromExcelFile[T any](f *excelize.File, o *Options) ([]T, []RowError, er
 // streamFromExcelFile implements the core streaming logic using Options.streamHandler.
 func streamFromExcelFile[T any](f *excelize.File, o *Options) ([]RowError, error) {
 	if o.streamHandler == nil {
-		return nil, fmt.Errorf("excelio: WithStreamRead() is required for Stream/StreamFile")
+		return nil, fmt.Errorf("excelio: OnStreamRow() is required for Stream/StreamFile")
 	}
 
 	sheet, err := resolveSheet(f, o)
@@ -965,7 +965,7 @@ func Read[T any](r io.Reader, opts ...Option) ([]T, []RowError, error) {
 }
 
 // StreamFile streams an Excel file from a file path, calling the handler
-// supplied via WithStreamRead(...) for each non-empty data row.
+// supplied via OnStreamRow(...) for each non-empty data row.
 // It returns a slice of RowError for all rows with issues.
 // If ErrCol(...) is set and there are errors, it will also write error messages
 // back into the original file in the specified column.
@@ -977,7 +977,7 @@ func StreamFile[T any](path string, opts ...Option) ([]RowError, error) {
 	applyDefaults(&o)
 
 	if o.streamHandler == nil {
-		return nil, fmt.Errorf("excelio: WithStreamRead() is required for StreamFile")
+		return nil, fmt.Errorf("excelio: OnStreamRow() is required for StreamFile")
 	}
 
 	f, err := excelize.OpenFile(path)
@@ -1002,7 +1002,7 @@ func StreamFile[T any](path string, opts ...Option) ([]RowError, error) {
 }
 
 // Stream streams an Excel file from an io.Reader, calling the handler supplied
-// via WithStreamRead(...) for each non-empty data row.
+// via OnStreamRow(...) for each non-empty data row.
 // It returns a slice of RowError for all rows with issues.
 // This variant does not modify the original source (no path), but you can
 // later call WriteErrorsTo(...) if you want to produce a new file with errors.
@@ -1014,7 +1014,7 @@ func Stream[T any](r io.Reader, opts ...Option) ([]RowError, error) {
 	applyDefaults(&o)
 
 	if o.streamHandler == nil {
-		return nil, fmt.Errorf("excelio: WithStreamRead() is required for Stream")
+		return nil, fmt.Errorf("excelio: OnStreamRow() is required for Stream")
 	}
 
 	f, err := excelize.OpenReader(r)
@@ -1114,4 +1114,384 @@ func writeErrorsToExcelFile(f *excelize.File, errs []RowError, o *Options, w io.
 		return f.Write(w)
 	}
 	return f.Save()
+}
+
+/* =========================================================
+ *  Writer side: normal + streaming
+ * ========================================================= */
+
+// StreamWriter writes rows in streaming mode based on struct tags
+// (`excel`, `col`, `excelcol`) and reuses the same metadata/cache
+// as the read side.
+//
+// Usage:
+//
+//	sw, _ := excelio.NewStreamWriterFile[Product]("out.xlsx",
+//	    excelio.Sheet("Products"),
+//	    excelio.Header(1),
+//	    excelio.StartRow(2),
+//	)
+//	defer sw.Close()
+//
+//	for _, p := range products {
+//	    _ = sw.WriteRow(&p)
+//	}
+type StreamWriter[T any] struct {
+	f      *excelize.File
+	sw     *excelize.StreamWriter
+	opts   *Options
+	meta   *typeMeta
+	fields []*fieldMeta
+
+	fieldColIndex map[*fieldMeta]int
+	maxColIndex   int
+
+	curRow int // next row to write (Excel 1-based)
+
+	out    io.Writer
+	path   string
+	closed bool
+
+	// rowBuf is a reusable buffer for row values to avoid per-row allocations.
+	rowBuf []interface{}
+}
+
+// buildFieldOrderForWrite determines a stable column index for each mapped field.
+// Priority:
+//  1. col:"N"
+//  2. excelcol:"A"
+//  3. auto-assign sequentially from the left
+//
+// Returns:
+//   - ordered slice of fields (left → right)
+//   - map[fieldMeta]int: column index (0-based)
+//   - max column index
+func buildFieldOrderForWrite(meta *typeMeta) (fields []*fieldMeta, index map[*fieldMeta]int, maxCol int) {
+	index = make(map[*fieldMeta]int, len(meta.Fields))
+
+	used := map[int]bool{}
+	autoIndex := 0
+	maxCol = -1
+
+	// 1) Assign explicit indices first (col / excelcol).
+	for _, fm := range meta.Fields {
+		idx := -1
+		if fm.ColIndexTag >= 0 {
+			idx = fm.ColIndexTag
+		} else if fm.ColLetterTag != "" {
+			idx = colIndexFromLetter(fm.ColLetterTag)
+		}
+		if idx >= 0 {
+			index[fm] = idx
+			used[idx] = true
+			if idx > maxCol {
+				maxCol = idx
+			}
+		}
+	}
+
+	// 2) Auto-assign remaining fields to next free column.
+	for _, fm := range meta.Fields {
+		if _, ok := index[fm]; ok {
+			continue
+		}
+		for used[autoIndex] {
+			autoIndex++
+		}
+		index[fm] = autoIndex
+		used[autoIndex] = true
+		if autoIndex > maxCol {
+			maxCol = autoIndex
+		}
+		autoIndex++
+	}
+
+	// 3) Build ordered slice from left to right.
+	tmp := make(map[int]*fieldMeta, len(meta.Fields))
+	for fm, idx := range index {
+		tmp[idx] = fm
+	}
+
+	fields = make([]*fieldMeta, 0, len(meta.Fields))
+	for col := 0; col <= maxCol; col++ {
+		if fm, ok := tmp[col]; ok {
+			fields = append(fields, fm)
+		}
+	}
+
+	return fields, index, maxCol
+}
+
+// fieldHeaderName returns the header text for a field when writing header row.
+func fieldHeaderName(fm *fieldMeta) string {
+	if fm == nil {
+		return ""
+	}
+	if len(fm.ColumnNames) > 0 && fm.ColumnNames[0] != "" {
+		return fm.ColumnNames[0]
+	}
+	return fm.FieldName
+}
+
+// valueToCell converts a field value to a cell value that excelize can handle.
+// It respects time formats from fieldMeta.TimeFormat if set.
+func valueToCell(v reflect.Value, fm *fieldMeta) any {
+	if !v.IsValid() {
+		return ""
+	}
+
+	// Handle pointer.
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+
+	switch v.Kind() {
+	case reflect.String:
+		return v.String()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return v.Uint()
+	case reflect.Float32, reflect.Float64:
+		return v.Float()
+	case reflect.Bool:
+		return v.Bool()
+	case reflect.Struct:
+		if v.Type() == reflect.TypeOf(time.Time{}) {
+			t := v.Interface().(time.Time)
+			if t.IsZero() {
+				return ""
+			}
+			if fm != nil && fm.TimeFormat != "" {
+				return t.Format(fm.TimeFormat)
+			}
+			// Default time format for write.
+			return t.Format("2006-01-02 15:04:05")
+		}
+	}
+
+	// Fallback: string representation.
+	return fmt.Sprintf("%v", v.Interface())
+}
+
+// newStreamWriterCore initializes a StreamWriter that writes to either
+// a file path or an io.Writer, sharing the same Options/typeMeta as read side.
+func newStreamWriterCore[T any](o *Options, out io.Writer, path string) (*StreamWriter[T], error) {
+	// 1) Create a new workbook.
+	f := excelize.NewFile()
+
+	// 2) Resolve sheet name: if SheetName is empty, use default active sheet.
+	sheet := o.SheetName
+	if sheet == "" {
+		sheet = f.GetSheetName(f.GetActiveSheetIndex())
+	} else {
+		defaultSheet := f.GetSheetName(f.GetActiveSheetIndex())
+		if defaultSheet != sheet {
+			idx, err := f.NewSheet(sheet)
+			if err != nil {
+				return nil, err
+			}
+			// Remove default sheet to keep file clean.
+			_ = f.DeleteSheet(defaultSheet)
+			f.SetActiveSheet(idx)
+		}
+	}
+	o.sheetResolved = sheet
+
+	// 3) Create excelize stream writer.
+	esw, err := f.NewStreamWriter(sheet)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4) Build type metadata & field order.
+	t := reflect.TypeOf((*T)(nil)).Elem()
+	meta, err := getTypeMeta(t)
+	if err != nil {
+		return nil, err
+	}
+	fields, fieldColIndex, maxCol := buildFieldOrderForWrite(meta)
+
+	sw := &StreamWriter[T]{
+		f:             f,
+		sw:            esw,
+		opts:          o,
+		meta:          meta,
+		fields:        fields,
+		fieldColIndex: fieldColIndex,
+		maxColIndex:   maxCol,
+		out:           out,
+		path:          path,
+		rowBuf:        make([]interface{}, maxCol+1),
+	}
+
+	// 5) Write header row if configured.
+	if o.HeaderRow > 0 {
+		rowVals := sw.rowBuf
+		for i := range rowVals {
+			rowVals[i] = nil
+		}
+		for _, fm := range sw.fields {
+			colIdx := sw.fieldColIndex[fm]
+			if colIdx < 0 || colIdx >= len(rowVals) {
+				continue
+			}
+			rowVals[colIdx] = fieldHeaderName(fm)
+		}
+		axis := fmt.Sprintf("A%d", o.HeaderRow)
+		if err := sw.sw.SetRow(axis, rowVals); err != nil {
+			return nil, err
+		}
+	}
+
+	// 6) Determine first data row.
+	if o.FirstDataRow > 0 {
+		sw.curRow = o.FirstDataRow
+	} else if o.HeaderRow > 0 {
+		sw.curRow = o.HeaderRow + 1
+	} else {
+		sw.curRow = 1
+	}
+
+	return sw, nil
+}
+
+// NewStreamWriterFile creates a streaming writer that writes Excel content to a file path.
+// It uses the same Options semantics as the reader side (Sheet, Header, StartRow).
+func NewStreamWriterFile[T any](path string, opts ...Option) (*StreamWriter[T], error) {
+	var o Options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	applyDefaults(&o)
+	return newStreamWriterCore[T](&o, nil, path)
+}
+
+// NewStreamWriter creates a streaming writer that writes Excel content to an io.Writer,
+// such as an HTTP response or bytes.Buffer.
+func NewStreamWriter[T any](w io.Writer, opts ...Option) (*StreamWriter[T], error) {
+	if w == nil {
+		return nil, fmt.Errorf("excelio: writer must not be nil")
+	}
+	var o Options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	applyDefaults(&o)
+	return newStreamWriterCore[T](&o, w, "")
+}
+
+// WriteRow writes a single struct value as one row into the sheet.
+// T is expected to be a struct type (same requirement as the read side).
+func (sw *StreamWriter[T]) WriteRow(obj *T) error {
+	if sw == nil || sw.sw == nil {
+		return fmt.Errorf("excelio: stream writer is nil")
+	}
+	if obj == nil {
+		// nothing to write
+		return nil
+	}
+
+	v := reflect.ValueOf(*obj)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return fmt.Errorf("excelio: WriteRow expects struct type, got %s", v.Kind())
+	}
+
+	rowVals := sw.rowBuf
+	for i := range rowVals {
+		rowVals[i] = nil
+	}
+
+	for _, fm := range sw.fields {
+		colIdx := sw.fieldColIndex[fm]
+		if colIdx < 0 || colIdx >= len(rowVals) {
+			continue
+		}
+		fieldVal := v.FieldByIndex(fm.Index)
+		rowVals[colIdx] = valueToCell(fieldVal, fm)
+	}
+
+	axis := fmt.Sprintf("A%d", sw.curRow)
+	if err := sw.sw.SetRow(axis, rowVals); err != nil {
+		return err
+	}
+	sw.curRow++
+	return nil
+}
+
+// WriteRows writes multiple struct values as subsequent rows.
+func (sw *StreamWriter[T]) WriteRows(objs []T) error {
+	for i := range objs {
+		if err := sw.WriteRow(&objs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Close flushes the stream and writes/saves the workbook.
+// It is safe to call Close multiple times; subsequent calls are no-ops.
+func (sw *StreamWriter[T]) Close() error {
+	if sw == nil || sw.sw == nil {
+		return nil
+	}
+	if sw.closed {
+		return nil
+	}
+	sw.closed = true
+
+	if err := sw.sw.Flush(); err != nil {
+		return err
+	}
+
+	// Write to appropriate sink.
+	if sw.out != nil {
+		return sw.f.Write(sw.out)
+	}
+	if sw.path != "" {
+		return sw.f.SaveAs(sw.path)
+	}
+	return nil
+}
+
+// WriteFile writes a slice of structs as Excel rows into a file path using streaming.
+// For huge datasets this is memory-friendly because it does not materialize all rows
+// inside excelize's in-memory structures.
+func WriteFile[T any](path string, rows []T, opts ...Option) error {
+	sw, err := NewStreamWriterFile[T](path, opts...)
+	if err != nil {
+		return err
+	}
+	defer sw.Close()
+
+	for i := range rows {
+		if err := sw.WriteRow(&rows[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Write writes a slice of structs as Excel rows into an io.Writer using streaming.
+// This is ideal for HTTP handlers or any case where you want to stream out
+// the XLSX file directly without touching disk.
+func Write[T any](w io.Writer, rows []T, opts ...Option) error {
+	sw, err := NewStreamWriter[T](w, opts...)
+	if err != nil {
+		return err
+	}
+	defer sw.Close()
+
+	for i := range rows {
+		if err := sw.WriteRow(&rows[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }

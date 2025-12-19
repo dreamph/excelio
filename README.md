@@ -1,241 +1,196 @@
-# `excelio`  
-### ⚡ Fast • Stream • Map Excel → Go Struct • Validate • Write Back Errors
-
-> Production-ready Excel ingestion library for Go  
-> Map Excel rows → Go structs automatically  
-> Support streaming (low memory), validation, and writing error messages back into Excel
+# **excelio**
+🔥 Simple • Fast • Memory-Efficient Excel → Go Struct Mapping & Writing
 
 ---
 
 ## ✨ Features
-
-- 🔥 **Auto-map Excel → struct**  
-  via tags:
-  - `excel:"Code"` → header name  
-  - `col:"2"` → column index  
-  - `excelcol:"C"` → Excel column letter
-
-- ⚡ **Streaming mode (Low RAM)**  
-  process millions of rows without loading entire sheet
-
-- 🛡️ Validation support  
-  via `go-playground/validator`
-
-- 🧠 Smart type conversion
-  - `string`
-  - `int / uint`
-  - `float`
-  - `bool`
-  - `time.Time` (custom format + Excel serial dates)
-
-- 📝 Write error messages back to Excel  
-  - Modify existing file
-  - Or create a new one (HTTP friendly)
-
-- 🧩 Io.Reader / Io.Writer support  
-  perfect for **HTTP Upload APIs**
+- **Tag Mapping**
+  ```go
+  excel:"Code"      // by header
+  col:"2"           // by column index
+  excelcol:"C"      // by Excel letter
+  ```
+- **Streaming Read / Write** — process millions of rows with low memory
+- **Strong Type Conversion**
+  `string, int, uint, float, bool, time.Time (+ excel serial)`
+- **Validation** — works with `go-playground/validator`
+- **Error Tracking**
+  - detailed row/column errors
+  - write-back errors into Excel
+- **Works with `io.Reader / io.Writer`**
 
 ---
 
-## 🚀 Install
+# 🚀 Quick Start
 
-```sh
-go get github.com/yourorg/excelio
-```
-
----
-
-## 🧬 Define Your Struct
-
+### Struct
 ```go
 type Product struct {
-	Code   string    `excel:"Code"   validate:"required"`
-	Name   string    `col:"2"        validate:"required"`
-	Price  float64   `excelcol:"C"   validate:"required,gt=0"`
-	Active bool      `excel:"Active" validate:"required"`
-	Since  time.Time `excel:"Since"  fmt:"2006-01-02"`
+    Code   string    `excel:"Code"`
+    Name   string    `col:"2"`
+    Price  float64   `excelcol:"C"`
+    Active bool      `excel:"Active" validate:"required"`
+    Since  time.Time `excel:"Since" fmt:"2006-01-02"`
 }
 ```
 
-**Supported tags**
-
-| Tag | Meaning |
-|------|--------|
-| `excel:"Header"` | Map by column header |
-| `col:"2"` | Map by index (1-based) |
-| `excelcol:"C"` | Map by Excel column letter |
-| `fmt:"..."` | Custom time format |
-| `validate:"..."` | go-validator rules |
-| `required:"true"` | Required at mapping stage |
-
 ---
 
-# 🟢 1️⃣ Read Entire Sheet
+# Read (Normal)
+Read everything into memory.
 
 ```go
-v := validator.New()
-
-products, errs, err := excelio.ReadFile[Product](
+rows, errs, err := excelio.ReadFile[Product](
     "products.xlsx",
     excelio.Sheet("Products"),
     excelio.Header(1),
     excelio.StartRow(2),
-    excelio.UseValidator(v),
 )
 ```
 
-✔️ `products` → valid rows  
-⚠️ `errs` → list of row errors
+Or from upload:
+
+```go
+rows, errs, err := excelio.Read[Product](file)
+```
 
 ---
 
-# 🟠 2️⃣ Streaming Mode (Ultra Fast)
-
-Process rows **without loading entire sheet**
-Perfect for big files.
+# Stream Read (Low Memory)
+Process row-by-row.
 
 ```go
-rowErrs, err := excelio.StreamFile[Product](
+_, err := excelio.StreamFile[Product](
     "products.xlsx",
     excelio.Sheet("Products"),
     excelio.Header(1),
     excelio.StartRow(2),
-    excelio.ErrCol(10), // put errors into column J
-    excelio.OnStreamRow(func(rowIdx, logicalIdx int, p *Product, errs []excelio.RowError) error {
-        if len(errs) > 0 {
-            fmt.Println("❌ Row:", rowIdx, errs)
+
+    excelio.OnStreamRow(func(rowIdx, logicalIdx int, p *Product, rowErrs []excelio.RowError) error {
+        if len(rowErrs) > 0 {
+            fmt.Println("Row Error", rowErrs)
             return nil
         }
 
-        fmt.Println("✅", *p)
-        // Insert to DB here
+        fmt.Println("Product", p)
         return nil
     }),
 )
 ```
 
-✔️ `rowErrs` → summary  
-✔️ Automatically writes errors back to Excel file
-
 ---
 
-# 🔵 3️⃣ HTTP Upload → Stream
-
-Use with `io.Reader`  
-Zero temp file needed
-
+# Write (Normal)
 ```go
-rowErrs, err := excelio.Stream[Product](
-    file, // multipart.File
-    excelio.SheetAt(0),
+err := excelio.WriteFile(
+    "out.xlsx",
+    products,
+    excelio.Sheet("Products"),
     excelio.Header(1),
     excelio.StartRow(2),
-    excelio.OnStreamRow(func(rowIdx, logicalIdx int, p *Product, errs []excelio.RowError) error {
-        if len(errs) == 0 && p != nil {
-            // process
-        }
-        return nil
-    }),
 )
+```
+
+Write to HTTP response:
+```go
+excelio.Write(w, products)
 ```
 
 ---
 
-# 🟥 4️⃣ Return Excel With Error Column
-
-Perfect for APIs that validate user Excel uploads.
-
-Upload → Validate → Return highlighted Excel
+# Stream Write (Big Data)
+Write millions of rows efficiently.
 
 ```go
-excelio.WriteErrorsTo(
-    w,                     // io.Writer (HTTP Response)
-    bytes.NewReader(buf),  // original file
-    rowErrs,
-    excelio.SheetAt(0),
-    excelio.ErrCol(10),
+sw, _ := excelio.NewStreamWriterFile[Product](
+    "big.xlsx",
+    excelio.Sheet("Products"),
+    excelio.Header(1),
+    excelio.StartRow(2),
 )
-```
+defer sw.Close()
 
-Client downloads Excel with error messages auto-filled 😎
-
----
-
-## ⚙️ Options Cheat Sheet
-
-| Option | Purpose |
-|--------|--------|
-| `Sheet("Name")` | Select sheet by name |
-| `SheetAt(0)` | Select sheet by index |
-| `Header(1)` | Header row number |
-| `StartRow(2)` | First data row |
-| `ErrCol(10)` | Error output column |
-| `UseValidator(v)` | Enable validator |
-| `OnStreamRow(fn)` | Streaming handler |
-
----
-
-## 🧪 RowError Structure
-
-```go
-type RowError struct {
-	ExcelRowIndex int
-	LogicalIndex  int
-	ColIndex      int
-	ColLetter     string
-	Field         string
-	Column        string
-	Value         string
-	Err           error
+for _, p := range bigProducts {
+    sw.WriteRow(&p)
 }
 ```
 
-So you can return rich responses
-(JSON, logs, UI highlights etc.)
+HTTP streaming
+```go
+sw, _ := excelio.NewStreamWriter(w)
+defer sw.Close()
+sw.WriteRows(products)
+```
 
 ---
 
-## ⚡ Performance Notes
+# Validation (go-playground)
+```go
+validate := validator.New()
 
-- **Streaming API** uses:
-  - no full sheet materialization
-  - efficient reflection metadata cache
-- Designed for:
-  - Large corporate Excel imports
-  - Financial / enterprise usage
-- Memory stays small even on big sheets
+rows, errs, err := excelio.ReadFile[Product](
+    "products.xlsx",
+    excelio.UseValidator(validate),
+)
+```
 
----
-
-## ❤️ Designed For Humans
-
-- Clean minimal API  
-- Zero magic hidden behavior  
-- Works great in production
+Automatically produces field-aware RowError.
 
 ---
 
-## 📌 Roadmap
+# Error Write-Back to Excel
 
-- Parallel streaming mode  
-- Custom converters per field  
-- Nested struct support  
-- Built-in Excel template generator  
+```go
+excelio.WriteErrors("products.xlsx", rowErrs, excelio.ErrCol(10))
+```
 
----
+Or create a new file output:
 
-## 🧑‍💻 Contribute
-
-PRs welcome 🎉  
-Open issues  
-Discuss architecture  
-Let’s build the best Excel ingestion library in Go
+```go
+excelio.WriteErrorsTo(w, r, rowErrs, excelio.ErrCol(10))
+```
 
 ---
 
-## ⭐ Final Words
+# 🧠 RowError Structure
+```go
+type RowError struct {
+    ExcelRowIndex int
+    LogicalIndex  int
+    ColIndex      int
+    ColLetter     string
+    Field         string
+    Column        string
+    Value         string
+    Err           error
+}
+```
 
-If your system imports Excel,
-**excelio makes it safe, fast, and developer-friendly.**
+---
 
-Enjoy building 🚀
+# ⚙️ Options Summary
+| Option | Description |
+|--------|------------|
+| `Sheet("Name")` | Select sheet |
+| `SheetAt(0)` | Select sheet by index |
+| `Header(1)` | Header row |
+| `StartRow(2)` | First data row |
+| `ErrCol(10)` | Error Column |
+| `UseValidator(v)` | Enable validation |
+| `OnStreamRow(fn)` | Stream handler |
+
+---
+
+# 🧵 Designed for Production
+- Zero reflection per row after metadata cache
+- Metadata caching with sync.Map
+- Streaming I/O = constant RAM
+- Works great with DB pipelines
+- Friendly API + powerful control
+
+---
+
+# Credits
+Powered by:
+- `excelize`
+- `go-playground/validator`
